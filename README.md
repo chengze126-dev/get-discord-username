@@ -144,6 +144,16 @@ DISCORD_GUILD_ID=123456789012345678
 # SCOUT_DATA_DIR=/custom/path    (optional, defaults to ./data)
 ```
 
+**Set the Guild ID automatically.** Once the bot is invited, run:
+
+```bash
+python set_guild_id.py            # lists the servers your bot is in; pick one, and .env is updated
+python set_guild_id.py --name Dev # picks the server whose name contains "Dev"
+python set_guild_id.py --list     # only lists the servers
+```
+
+The script uses the bot token from `.env` or the credential store (or asks for it). It only sees servers the bot has been invited to. If you ever saved a Guild ID on the Settings page, that saved value wins over `.env`.
+
 `.env` is git-ignored. Token lookup order: OS credential store → `DISCORD_BOT_TOKEN` → a session-only token entered in the UI.
 
 Other settings are stored in the local SQLite `settings` table:
@@ -228,6 +238,7 @@ Logs are in `data/scout.log`.
 ```
 discord-member-scout/
 ├── main.py                  # entry point: Qt + asyncio (qasync) loop, tray, shutdown
+├── set_guild_id.py          # helper: list the bot's servers and write DISCORD_GUILD_ID to .env
 ├── requirements.txt
 ├── README.md
 ├── .env.example
