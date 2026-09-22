@@ -1,0 +1,7 @@
+PySide6>=6.6,<7
+discord.py>=2.4,<3
+qasync>=0.27
+aiohttp>=3.9
+keyring>=25.0
+python-dotenv>=1.0
+plyer>=2.1
