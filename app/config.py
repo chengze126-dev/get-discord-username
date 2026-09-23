@@ -29,7 +29,9 @@ THEMES = ("dark", "light", "system")
 
 ENV_PATH = PROJECT_ROOT / ".env"
 ENV_EXAMPLE_PATH = PROJECT_ROOT / ".env.example"
-GUILD_ENV_KEY = "DISCORD_GUILD_ID"
+GUILD_IDS_ENV_KEY = "DISCORD_GUILD_IDS"
+LEGACY_GUILD_ENV_KEY = "DISCORD_GUILD_ID"  # single-server setting from earlier versions
+MAX_GUILDS = 25
 
 KEYRING_SERVICE = APP_ID
 KEYRING_USERNAME = "discord-bot-token"
@@ -37,7 +39,7 @@ KEYRING_USERNAME = "discord-bot-token"
 
 @dataclass(frozen=True)
 class Settings:
-    guild_id: int | None = None
+    guild_ids: tuple[int, ...] = ()
     cutoff: datetime = DEFAULT_CUTOFF
     scan_interval: int = MIN_SCAN_INTERVAL
     ignore_bots: bool = True
@@ -55,6 +57,7 @@ class Settings:
         max_notes = max(1, min(1000, int(self.max_notifications_per_scan)))
         return replace(
             self,
+            guild_ids=tuple(dict.fromkeys(int(g) for g in self.guild_ids))[:MAX_GUILDS],
             cutoff=ensure_utc(self.cutoff),
             scan_interval=interval,
             max_notifications_per_scan=max_notes,
@@ -75,6 +78,23 @@ def _parse_int(value: str | None) -> int | None:
     if not value.isdigit():
         return None
     return int(value)
+
+
+def parse_guild_ids(*values: str | None) -> tuple[int, ...]:
+    """Parse comma/space/newline separated Discord IDs, keeping order and dropping duplicates."""
+    ids: list[int] = []
+    for value in values:
+        if not value:
+            continue
+        for part in value.replace(";", ",").replace("\n", ",").replace(" ", ",").split(","):
+            part = part.strip()
+            if part.isdigit() and 15 <= len(part) <= 21:
+                ids.append(int(part))
+    return tuple(dict.fromkeys(ids))
+
+
+def format_guild_ids(guild_ids: tuple[int, ...] | list[int]) -> str:
+    return ",".join(str(g) for g in guild_ids)
 
 
 def write_env_value(key: str, value: str, path=ENV_PATH) -> None:
@@ -113,10 +133,13 @@ class SettingsStore:
     def load(self) -> Settings:
         raw = self._db.get_all_settings()
         # .env / environment wins, so edits to .env (by hand or set_guild_id.py) take effect.
-        guild_id = _parse_int(os.environ.get(GUILD_ENV_KEY)) or _parse_int(raw.get("guild_id"))
+        # DISCORD_GUILD_ID (single server, older versions) is still honoured.
+        guild_ids = parse_guild_ids(os.environ.get(GUILD_IDS_ENV_KEY), os.environ.get(LEGACY_GUILD_ENV_KEY))
+        if not guild_ids:
+            guild_ids = parse_guild_ids(raw.get("guild_ids"), raw.get("guild_id"))
         cutoff = from_iso(raw.get("cutoff")) or DEFAULT_CUTOFF
         return Settings(
-            guild_id=guild_id,
+            guild_ids=guild_ids,
             cutoff=cutoff,
             scan_interval=_parse_int(raw.get("scan_interval")) or MIN_SCAN_INTERVAL,
             ignore_bots=_parse_bool(raw.get("ignore_bots"), True),
@@ -130,7 +153,8 @@ class SettingsStore:
         settings = settings.normalized()
         self._db.set_settings(
             {
-                "guild_id": str(settings.guild_id) if settings.guild_id else "",
+                "guild_ids": format_guild_ids(settings.guild_ids),
+                "guild_id": "",  # superseded by guild_ids
                 "cutoff": to_iso(settings.cutoff) or "",
                 "scan_interval": str(settings.scan_interval),
                 "ignore_bots": "1" if settings.ignore_bots else "0",

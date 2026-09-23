@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import html
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QDate, QDateTime, QRegularExpression, Qt, QTime, QTimeZone, Signal
-from PySide6.QtGui import QRegularExpressionValidator
+from PySide6.QtCore import QDate, QDateTime, Qt, QTime, QTimeZone, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QComboBox,
     QDateTimeEdit,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -21,8 +26,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.config import MAX_SCAN_INTERVAL, MIN_SCAN_INTERVAL, Settings
-from app.discord_service import ConnectionTestResult
+from app.config import MAX_GUILDS, MAX_SCAN_INTERVAL, MIN_SCAN_INTERVAL, Settings, parse_guild_ids
+from app.discord_service import BotGuild, ConnectionTestResult
 from ui.components.icons import themed_icon
 from ui.components.toggle_switch import ToggleSwitch
 from ui.dashboard import PageHeader
@@ -112,9 +117,47 @@ class _Section(QFrame):
         self._layout.addWidget(widget)
 
 
+class GuildPickerDialog(QDialog):
+    """Checklist of the servers the bot has been invited to."""
+
+    def __init__(self, guilds: list[BotGuild], selected: tuple[int, ...], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select servers")
+        self.setMinimumWidth(460)
+        p = ThemeManager.instance().palette
+        self.setStyleSheet(f"QDialog {{ background: {p.surface}; }}")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(10)
+        title = QLabel("Servers your bot is in")
+        title.setObjectName("H2")
+        hint = QLabel("Tick the servers to monitor. Members of each server are fetched and shown separately.")
+        hint.setObjectName("SettingHint")
+        hint.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+        self._boxes: list[tuple[QCheckBox, int]] = []
+        for guild in guilds:
+            members = f"  ·  ~{guild.approximate_members:,} members" if guild.approximate_members else ""
+            box = QCheckBox(f"{guild.name}   ({guild.id}){members}")
+            box.setChecked(guild.id in selected)
+            box.setCursor(Qt.CursorShape.PointingHandCursor)
+            layout.addWidget(box)
+            self._boxes.append((box, guild.id))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addSpacing(6)
+        layout.addWidget(buttons)
+
+    def selected_ids(self) -> list[int]:
+        return [gid for box, gid in self._boxes if box.isChecked()]
+
+
 class SettingsPage(QWidget):
     save_requested = Signal(object)          # SettingsForm
-    test_requested = Signal(str, object)     # token ('' = stored), guild id | None
+    test_requested = Signal(str, object)     # token ('' = stored), tuple of guild ids
+    find_servers_requested = Signal(str)     # token ('' = stored)
     clear_token_requested = Signal()
     test_notification_requested = Signal()
     theme_preview = Signal(str)
@@ -162,7 +205,7 @@ class SettingsPage(QWidget):
         layout.addLayout(wrapper)
 
         # ---------------------------------------------------------- Discord
-        discord_section = _Section("Discord", "plug", "Official Bot API credentials for an authorized server")
+        discord_section = _Section("Discord", "plug", "Official Bot API credentials and the servers the bot was invited to")
         token_row = QHBoxLayout()
         token_row.setSpacing(6)
         self.token = QLineEdit()
@@ -190,15 +233,32 @@ class SettingsPage(QWidget):
         self.token_source.setWordWrap(True)
         discord_section.add_widget(self.token_source)
 
-        self.guild = QLineEdit()
-        self.guild.setPlaceholderText("e.g. 123456789012345678")
-        self.guild.setValidator(QRegularExpressionValidator(QRegularExpression(r"^\d{0,20}$")))
+        guild_row = QHBoxLayout()
+        guild_row.setSpacing(6)
+        self.guild = QPlainTextEdit()
+        self.guild.setObjectName("GuildIds")
+        self.guild.setPlaceholderText("123456789012345678\n987654321098765432")
         self.guild.setMinimumWidth(320)
+        self.guild.setFixedHeight(86)
+        self.guild.setTabChangesFocus(True)
+        self.guild.textChanged.connect(self._update_guild_hint)
+        self.find_servers = QPushButton("Find my servers…")
+        self.find_servers.setObjectName("SecondaryButton")
+        self.find_servers.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.find_servers.setToolTip("List the servers the bot has been invited to and pick them")
+        self.find_servers.clicked.connect(self._on_find_servers)
+        guild_row.addWidget(self.guild, 1)
+        guild_row.addWidget(self.find_servers, 0, Qt.AlignmentFlag.AlignTop)
         discord_section.add_row(
-            "Guild ID",
-            "Developer Mode → right-click the server icon → Copy Server ID. Saved to .env as DISCORD_GUILD_ID.",
-            self.guild,
+            "Server (Guild) IDs",
+            f"One or more IDs, one per line or separated by commas (up to {MAX_GUILDS}). Developer Mode → right-click a server "
+            "icon → Copy Server ID. Saved to .env as DISCORD_GUILD_IDS.",
+            guild_row,
+            stretch_control=True,
         )
+        self.guild_hint = QLabel()
+        self.guild_hint.setObjectName("SettingHint")
+        discord_section.add_widget(self.guild_hint)
 
         test_row = QHBoxLayout()
         test_row.setSpacing(10)
@@ -208,7 +268,7 @@ class SettingsPage(QWidget):
         self.test_button.clicked.connect(self._on_test)
         test_row.addWidget(self.test_button)
         test_row.addStretch(1)
-        discord_section.add_row("Verify", "Checks the token, Server Members Intent and guild access over REST.", test_row)
+        discord_section.add_row("Verify", "Checks the token, Server Members Intent and access to every server over REST.", test_row)
         self.test_result = QLabel()
         self.test_result.setObjectName("TestResult")
         self.test_result.setWordWrap(True)
@@ -304,7 +364,7 @@ class SettingsPage(QWidget):
         self.token_source.setText(f"Token source: {token_source}")
         removable = "credential store" in token_source or "session" in token_source
         self.clear_token.setEnabled(has_token and removable)
-        self.guild.setText(str(settings.guild_id) if settings.guild_id else "")
+        self.guild.setPlainText("\n".join(str(g) for g in settings.guild_ids))
         self.cutoff.setDateTime(_qdatetime_from_utc(settings.cutoff))
         self.interval.setValue(settings.scan_interval)
         self.ignore_bots.setChecked(settings.ignore_bots)
@@ -318,18 +378,42 @@ class SettingsPage(QWidget):
         if ThemeManager.instance().mode != settings.theme:
             ThemeManager.instance().apply(settings.theme)  # undo an unsaved theme preview
 
-    def current_guild_id(self) -> int | None:
-        text = self.guild.text().strip()
-        return int(text) if text.isdigit() else None
+    def current_guild_ids(self) -> tuple[int, ...]:
+        return parse_guild_ids(self.guild.toPlainText())[:MAX_GUILDS]
+
+    def show_bot_guilds(self, result) -> None:
+        """Result of 'Find my servers…': list[BotGuild] or an error message."""
+        self.find_servers.setEnabled(True)
+        self.find_servers.setText("Find my servers…")
+        if isinstance(result, str):
+            self._show_message(False, "Could not list servers", [result])
+            return
+        if not result:
+            self._show_message(
+                False,
+                "The bot is not in any server yet",
+                ["Invite it with the OAuth2 URL Generator: scope = bot (not only applications.commands)."],
+            )
+            return
+        dialog = GuildPickerDialog(result, self.current_guild_ids(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            known = {g.id for g in result}
+            # keep manually entered IDs the bot can't see (so the user notices them), then the ticked ones
+            kept = [g for g in self.current_guild_ids() if g not in known]
+            self.guild.setPlainText("\n".join(str(g) for g in kept + dialog.selected_ids()))
 
     def show_test_result(self, result: ConnectionTestResult) -> None:
+        self._show_message(result.ok, result.title, result.details)
+        self.set_testing(False)
+
+    def _show_message(self, ok: bool, title: str, details: list[str]) -> None:
         p = ThemeManager.instance().palette
-        fg, bg = (p.success, p.success_soft) if result.ok else (p.danger, p.danger_soft)
-        lines = "".join(f"<br>• {line}" for line in result.details)
-        self.test_result.setText(f"<b style='color:{fg}'>{result.title}</b>{lines}")
+        fg, bg = (p.success, p.success_soft) if ok else (p.danger, p.danger_soft)
+        lines = "".join(f"<br>• {html.escape(line)}" for line in details)
+        self.test_result.setText(f"<b style='color:{fg}'>{html.escape(title)}</b>{lines}")
+        self.test_result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.test_result.setStyleSheet(f"background: {bg}; border: 1px solid {fg}; color: {p.text};")
         self.test_result.show()
-        self.set_testing(False)
 
     def set_testing(self, testing: bool) -> None:
         self.test_button.setEnabled(not testing)
@@ -350,11 +434,26 @@ class SettingsPage(QWidget):
     def _on_test(self) -> None:
         self.set_testing(True)
         self.test_result.hide()
-        self.test_requested.emit(self.token.text().strip(), self.current_guild_id())
+        self.test_requested.emit(self.token.text().strip(), self.current_guild_ids())
+
+    def _on_find_servers(self) -> None:
+        self.find_servers.setEnabled(False)
+        self.find_servers.setText("Loading…")
+        self.find_servers_requested.emit(self.token.text().strip())
+
+    def _update_guild_hint(self) -> None:
+        ids = self.current_guild_ids()
+        raw = self.guild.toPlainText()
+        raw_parts = [x for x in raw.replace(";", ",").replace("\n", ",").replace(" ", ",").split(",") if x.strip()]
+        invalid = len(raw_parts) - len(parse_guild_ids(raw))
+        text = f"{len(ids)} server{'s' if len(ids) != 1 else ''} configured"
+        if invalid > 0:
+            text += f" · {invalid} value(s) ignored (IDs are 17–20 digits)"
+        self.guild_hint.setText(text)
 
     def _on_save(self) -> None:
         settings = self._settings.with_changes(
-            guild_id=self.current_guild_id(),
+            guild_ids=self.current_guild_ids(),
             cutoff=_utc_from_qdatetime(self.cutoff.dateTime()),
             scan_interval=self.interval.value(),
             ignore_bots=self.ignore_bots.isChecked(),

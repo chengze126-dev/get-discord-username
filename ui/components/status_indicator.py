@@ -100,7 +100,7 @@ class ConnectionCard(QFrame):
         row.addWidget(self.title, 1)
         layout.addLayout(row)
 
-        self.guild = QLabel("Guild: —")
+        self.guild = QLabel("No servers")
         self.guild.setObjectName("ConnDetail")
         self.members = QLabel("")
         self.members.setObjectName("ConnDetail")
@@ -127,12 +127,12 @@ class ConnectionCard(QFrame):
 
     def set_guild(self, name: str | None, member_count: int | None) -> None:
         if name:
-            elided = self.guild.fontMetrics().elidedText(f"Guild: {name}", Qt.TextElideMode.ElideRight, 170)
+            elided = self.guild.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, 170)
             self.guild.setText(elided)
             self.guild.setToolTip(name)
             self.members.setText(f"{member_count:,} members" if member_count is not None else "")
             self.members.setVisible(member_count is not None)
         else:
-            self.guild.setText("Guild: —")
+            self.guild.setText("No servers")
             self.members.setText("")
             self.members.hide()

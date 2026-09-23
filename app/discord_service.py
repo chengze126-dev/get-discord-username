@@ -1,13 +1,13 @@
 """Discord gateway connection management (official Bot API only).
 
-The service owns a :class:`discord.Client` that runs on the shared asyncio
-loop (driven by Qt through qasync). It reports state changes to the UI through
-Qt signals and reconnects with exponential backoff when the connection cannot
-be (re-)established.
+One bot connection serves every configured server (guild). The service
+reports the connection state and a separate status for each configured guild
+(available, bot not a member, unavailable) through Qt signals. If the
+connection cannot be (re-)established it reconnects with exponential backoff.
 
 Only the ``guilds`` and ``members`` gateway intents are requested. ``members``
 is the privileged *Server Members Intent* that must be enabled in the Discord
-Developer Portal; without it Discord refuses the connection (close code 4014)
+Developer Portal. Without it Discord refuses the connection (close code 4014)
 and the service reports a clear error instead of retrying forever.
 """
 
@@ -24,17 +24,21 @@ import aiohttp
 import discord
 from PySide6.QtCore import QObject, Signal
 
-from app.models import ConnectionState, ErrorKind
+from app.models import ConnectionState, ErrorKind, GuildStatus
 
 log = logging.getLogger(__name__)
 
 BACKOFF_INITIAL = 2.0
 BACKOFF_MAX = 300.0
-# Discord throttles REQUEST_GUILD_MEMBERS (gateway op 8). Once a guild is chunked,
+# Discord throttles REQUEST_GUILD_MEMBERS (gateway op 8). Once a guild is chunked
 # the member cache is kept current by GUILD_MEMBER_ADD/UPDATE/REMOVE events, so
 # re-chunking is only needed after a fresh session, and never more than this often.
 CHUNK_COOLDOWN_SECONDS = 300.0
+# A manual "Refresh" may re-request the member list, but not more often than this per guild.
+FORCED_REFRESH_COOLDOWN = 60.0
 RATE_LIMIT_NOTICE_COOLDOWN = 30.0
+
+ProgressCallback = Callable[[int, int], None]  # (loaded, total)
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,7 @@ class GuildInfo:
     name: str
     member_count: int
     cached_members: int
+    icon_url: str | None = None
 
 
 @dataclass
@@ -53,11 +58,23 @@ class ConnectionTestResult:
     error_kind: ErrorKind | None = None
 
 
+@dataclass(frozen=True)
+class BotGuild:
+    id: int
+    name: str
+    approximate_members: int | None
+
+
 def build_intents() -> discord.Intents:
     intents = discord.Intents.none()
     intents.guilds = True   # guild, channel and role data (needed for permission checks)
     intents.members = True  # privileged: Server Members Intent
     return intents
+
+
+def invite_url(application_id: int | str) -> str:
+    """OAuth2 URL that adds the bot to a server (scope=bot, View Channels permission)."""
+    return f"https://discord.com/oauth2/authorize?client_id={application_id}&scope=bot&permissions=1024"
 
 
 def describe_exception(exc: BaseException) -> tuple[ErrorKind, str]:
@@ -114,25 +131,42 @@ class _RateLimitLogHandler(logging.Handler):
             self._callback(message)
 
 
-class DiscordService(QObject):
-    state_changed = Signal(str, str)        # ConnectionState value, detail text
-    guild_changed = Signal(object)          # GuildInfo | None
-    error_occurred = Signal(str, str)       # ErrorKind value, message
-    ready_changed = Signal(bool)            # True once the configured guild is available
+def _guild_info(guild: discord.Guild) -> GuildInfo:
+    icon = None
+    try:
+        if guild.icon is not None:
+            icon = guild.icon.replace(size=128, format="png").url
+    except Exception:  # noqa: BLE001
+        icon = None
+    return GuildInfo(
+        id=guild.id,
+        name=guild.name,
+        member_count=guild.member_count or len(guild.members),
+        cached_members=len(guild.members),
+        icon_url=icon,
+    )
 
-    def __init__(self, token_provider: Callable[[], str | None], guild_id: int | None) -> None:
+
+class DiscordService(QObject):
+    state_changed = Signal(str, str)             # ConnectionState value, detail text
+    guild_status_changed = Signal(object, str, str, object)  # guild id, GuildStatus value, message, GuildInfo|None
+    error_occurred = Signal(str, str)            # ErrorKind value, message
+    ready_changed = Signal(bool)                 # True once the gateway session is ready
+
+    def __init__(self, token_provider: Callable[[], str | None], guild_ids: tuple[int, ...]) -> None:
         super().__init__()
         self._token_provider = token_provider
-        self._guild_id = guild_id
+        self._guild_ids: tuple[int, ...] = tuple(guild_ids)
         self._client: discord.Client | None = None
         self._runner_task: asyncio.Task | None = None
         self._wake = asyncio.Event()
         self._stopping = False
         self._state = ConnectionState.DISCONNECTED
-        self._guild_ready = False
-        self._last_chunk_at: float = 0.0
-        self._chunk_lock = asyncio.Lock()
+        self._ready = False
+        self._last_chunk_at: dict[int, float] = {}
+        self._chunk_locks: dict[int, asyncio.Lock] = {}
         self._last_rate_notice = 0.0
+        self._reported_missing: set[int] = set()
         self._rate_handler = _RateLimitLogHandler(self._on_rate_limit_logged)
         logging.getLogger("discord.http").addHandler(self._rate_handler)
         logging.getLogger("discord.gateway").addHandler(self._rate_handler)
@@ -144,34 +178,41 @@ class DiscordService(QObject):
         return self._state
 
     @property
-    def guild_id(self) -> int | None:
-        return self._guild_id
+    def guild_ids(self) -> tuple[int, ...]:
+        return self._guild_ids
 
     @property
     def is_ready(self) -> bool:
-        return self._guild_ready and self.guild is not None
+        """True when the gateway session is ready (individual guilds may still be missing)."""
+        return self._ready and self._client is not None and self._client.is_ready()
 
-    @property
-    def guild(self) -> discord.Guild | None:
-        if self._client is None or self._guild_id is None or not self._client.is_ready():
+    def guild(self, guild_id: int) -> discord.Guild | None:
+        """The live guild object, or None if the bot is not in it / it is unavailable."""
+        if not self.is_ready:
             return None
-        guild = self._client.get_guild(self._guild_id)
+        guild = self._client.get_guild(guild_id)  # type: ignore[union-attr]
         if guild is None or guild.unavailable:
             return None
         return guild
+
+    def available_guild_ids(self) -> list[int]:
+        return [gid for gid in self._guild_ids if self.guild(gid) is not None]
 
     def start(self) -> None:
         if self._runner_task is None or self._runner_task.done():
             self._stopping = False
             self._runner_task = asyncio.ensure_future(self._run_forever())
 
-    def set_guild_id(self, guild_id: int | None) -> None:
-        if guild_id == self._guild_id:
+    def set_guild_ids(self, guild_ids: tuple[int, ...]) -> None:
+        guild_ids = tuple(guild_ids)
+        if guild_ids == self._guild_ids:
             return
-        self._guild_id = guild_id
-        self._last_chunk_at = 0.0
-        if self._client is not None and self._client.is_ready():
-            asyncio.ensure_future(self._resolve_guild())
+        self._guild_ids = guild_ids
+        self._reported_missing &= set(guild_ids)
+        if self.is_ready:
+            asyncio.ensure_future(self._resolve_guilds())
+        else:
+            self._update_connection_summary()
 
     async def restart(self) -> None:
         """Reconnect using the current token (e.g. after it was changed in Settings)."""
@@ -200,19 +241,28 @@ class DiscordService(QObject):
         logging.getLogger("discord.gateway").removeHandler(self._rate_handler)
         self._set_state(ConnectionState.DISCONNECTED, "Stopped")
 
-    async def ensure_member_cache(self, guild: discord.Guild) -> tuple[list[discord.Member], bool]:
-        """Return the guild's members, fetching them if the cache is incomplete.
+    async def ensure_member_cache(
+        self,
+        guild: discord.Guild,
+        force: bool = False,
+        progress: ProgressCallback | None = None,
+    ) -> tuple[list[discord.Member], bool]:
+        """Return this guild's members, fetching them if the cache is incomplete.
 
         Returns ``(members, complete)``. ``complete`` is True only when the list
         is known to contain every member (chunked via gateway or fully paged
-        over REST).
+        over REST). ``force`` re-requests the list (manual refresh), throttled
+        per guild. Members are always read from *this* guild object only.
         """
-        async with self._chunk_lock:
-            if guild.chunked:
+        lock = self._chunk_locks.setdefault(guild.id, asyncio.Lock())
+        async with lock:
+            now = time.monotonic()
+            last = self._last_chunk_at.get(guild.id, 0.0)
+            recently_forced = bool(last) and now - last < FORCED_REFRESH_COOLDOWN
+            if guild.chunked and not (force and not recently_forced):
                 return list(guild.members), True
 
-            now = time.monotonic()
-            if self._last_chunk_at and now - self._last_chunk_at < CHUNK_COOLDOWN_SECONDS:
+            if not guild.chunked and last and (recently_forced or (now - last < CHUNK_COOLDOWN_SECONDS and not force)):
                 # Recently chunked; the small drift is caused by joins/leaves in flight.
                 members = list(guild.members)
                 expected = guild.member_count or len(members)
@@ -221,22 +271,37 @@ class DiscordService(QObject):
             expected = guild.member_count or 0
             timeout = max(60.0, expected / 1000 * 3)
             log.info("Requesting full member list for guild %s (%s members)", guild.id, expected)
+            chunk_task = asyncio.ensure_future(guild.chunk(cache=True))
+            deadline = time.monotonic() + timeout
             try:
-                await asyncio.wait_for(guild.chunk(cache=True), timeout=timeout)
-                self._last_chunk_at = time.monotonic()
-                self._emit_guild_info()
+                while True:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(chunk_task), timeout=0.5)
+                        break
+                    except asyncio.TimeoutError:
+                        if progress is not None:
+                            progress(len(guild.members), expected)
+                        if time.monotonic() > deadline:
+                            raise
+                self._last_chunk_at[guild.id] = time.monotonic()
+                if progress is not None:
+                    progress(len(guild.members), guild.member_count or len(guild.members))
+                self._emit_guild(guild.id)
                 return list(guild.members), True
             except asyncio.TimeoutError:
-                log.warning("Gateway chunking timed out; falling back to paginated REST fetch")
+                chunk_task.cancel()
+                log.warning("Gateway chunking timed out for guild %s; falling back to REST paging", guild.id)
 
             # REST fallback: GET /guilds/{id}/members, 1000 per page (discord.py paginates
             # and honours rate-limit headers automatically).
             members: list[discord.Member] = []
             async for member in guild.fetch_members(limit=None):
                 members.append(member)
-                if len(members) % 5000 == 0:
+                if len(members) % 1000 == 0:
+                    if progress is not None:
+                        progress(len(members), expected)
                     await asyncio.sleep(0)
-            self._last_chunk_at = time.monotonic()
+            self._last_chunk_at[guild.id] = time.monotonic()
             return members, True
 
     # --------------------------------------------------------------- internal
@@ -245,9 +310,9 @@ class DiscordService(QObject):
         self._state = state
         self.state_changed.emit(state.value, detail)
 
-    def _set_guild_ready(self, ready: bool) -> None:
-        if ready != self._guild_ready:
-            self._guild_ready = ready
+    def _set_ready(self, ready: bool) -> None:
+        if ready != self._ready:
+            self._ready = ready
             self.ready_changed.emit(ready)
 
     def _emit_error(self, kind: ErrorKind, message: str) -> None:
@@ -264,31 +329,39 @@ class DiscordService(QObject):
             "Discord is rate limiting requests. Requests are being delayed automatically.",
         )
 
-    def _emit_guild_info(self) -> None:
-        guild = self.guild
-        if guild is None:
-            self.guild_changed.emit(None)
+    def _emit_guild(self, guild_id: int) -> None:
+        """Emit the current status of one configured guild."""
+        if guild_id not in self._guild_ids or self._client is None or not self._client.is_ready():
             return
-        self.guild_changed.emit(
-            GuildInfo(
-                id=guild.id,
-                name=guild.name,
-                member_count=guild.member_count or len(guild.members),
-                cached_members=len(guild.members),
+        guild = self._client.get_guild(guild_id)
+        if guild is None:
+            self.guild_status_changed.emit(
+                guild_id,
+                GuildStatus.NOT_MEMBER.value,
+                "The bot is not in this server, or the ID is wrong. Invite the bot with scope=bot.",
+                None,
             )
-        )
+        elif guild.unavailable:
+            self.guild_status_changed.emit(
+                guild_id, GuildStatus.UNAVAILABLE.value, "Temporarily unavailable (Discord outage)", None
+            )
+        else:
+            self.guild_status_changed.emit(guild_id, GuildStatus.AVAILABLE.value, "", _guild_info(guild))
 
-    async def _wait_for_wake(self, timeout: float | None) -> None:
-        try:
-            await asyncio.wait_for(self._wake.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            pass
-        self._wake.clear()
+    def _update_connection_summary(self) -> None:
+        if not self.is_ready:
+            return
+        if not self._guild_ids:
+            self._set_state(ConnectionState.ERROR, "No servers configured")
+            return
+        available = len(self.available_guild_ids())
+        total = len(self._guild_ids)
+        self._set_state(ConnectionState.CONNECTED, f"{available} of {total} server{'s' if total != 1 else ''} available")
 
     def _make_client(self) -> discord.Client:
         client = discord.Client(
             intents=build_intents(),
-            chunk_guilds_at_startup=False,  # only the configured guild is chunked, on demand
+            chunk_guilds_at_startup=False,  # only configured guilds are chunked, on demand
             max_messages=None,
             member_cache_flags=discord.MemberCacheFlags.from_intents(build_intents()),
             max_ratelimit_timeout=60.0,
@@ -297,54 +370,66 @@ class DiscordService(QObject):
         @client.event
         async def on_ready() -> None:
             log.info("Logged in as %s (id %s)", client.user, getattr(client.user, "id", "?"))
-            await self._resolve_guild()
+            self._set_ready(True)
+            await self._resolve_guilds()
 
         @client.event
         async def on_resumed() -> None:
-            await self._resolve_guild()
+            self._set_ready(True)
+            await self._resolve_guilds()
 
         @client.event
         async def on_disconnect() -> None:
             if self._stopping:
                 return
-            self._set_guild_ready(False)
+            self._set_ready(False)
             self._set_state(ConnectionState.DISCONNECTED, "Connection lost — reconnecting…")
 
         @client.event
         async def on_guild_available(guild: discord.Guild) -> None:
-            if guild.id == self._guild_id:
-                await self._resolve_guild()
+            if guild.id in self._guild_ids:
+                self._emit_guild(guild.id)
+                self._update_connection_summary()
 
         @client.event
         async def on_guild_unavailable(guild: discord.Guild) -> None:
-            if guild.id == self._guild_id:
-                self._set_guild_ready(False)
-                self._set_state(ConnectionState.ERROR, "Guild temporarily unavailable (Discord outage)")
+            if guild.id in self._guild_ids:
+                self._emit_guild(guild.id)
+                self._update_connection_summary()
 
         @client.event
         async def on_guild_join(guild: discord.Guild) -> None:
-            if guild.id == self._guild_id:
-                await self._resolve_guild()
+            if guild.id in self._guild_ids:
+                self._reported_missing.discard(guild.id)
+                self._emit_guild(guild.id)
+                self._update_connection_summary()
 
         @client.event
         async def on_guild_remove(guild: discord.Guild) -> None:
-            if guild.id == self._guild_id:
-                self._set_guild_ready(False)
-                self._set_state(ConnectionState.ERROR, "Bot was removed from the guild")
+            if guild.id in self._guild_ids:
+                self.guild_status_changed.emit(
+                    guild.id, GuildStatus.NOT_MEMBER.value, "The bot was removed from this server.", None
+                )
                 self._emit_error(
                     ErrorKind.GUILD_NOT_FOUND,
-                    f"The bot was removed from '{guild.name}'. Re-invite it to continue monitoring.",
+                    f"The bot was removed from '{guild.name}'. Re-invite it to keep monitoring that server.",
                 )
+                self._update_connection_summary()
+
+        @client.event
+        async def on_guild_update(_before: discord.Guild, after: discord.Guild) -> None:
+            if after.id in self._guild_ids:
+                self._emit_guild(after.id)
 
         @client.event
         async def on_member_join(member: discord.Member) -> None:
-            if member.guild.id == self._guild_id:
-                self._emit_guild_info()
+            if member.guild.id in self._guild_ids:
+                self._emit_guild(member.guild.id)
 
         @client.event
         async def on_member_remove(member: discord.Member) -> None:
-            if member.guild.id == self._guild_id:
-                self._emit_guild_info()
+            if member.guild.id in self._guild_ids:
+                self._emit_guild(member.guild.id)
 
         @client.event
         async def on_error(event_method: str, *args, **kwargs) -> None:
@@ -352,43 +437,36 @@ class DiscordService(QObject):
 
         return client
 
-    async def _resolve_guild(self) -> None:
+    async def _resolve_guilds(self) -> None:
         client = self._client
         if client is None or not client.is_ready():
             return
-        if self._guild_id is None:
-            self._set_guild_ready(False)
-            self._set_state(ConnectionState.ERROR, "No Guild ID configured")
-            self._emit_error(ErrorKind.GUILD_NOT_FOUND, "Set the Server (Guild) ID in Settings to start monitoring.")
+        if not self._guild_ids:
+            self._set_state(ConnectionState.ERROR, "No servers configured")
+            self._emit_error(ErrorKind.GUILD_NOT_FOUND, "Add at least one Server (Guild) ID in Settings.")
             return
-
-        guild = client.get_guild(self._guild_id)
-        if guild is None:
-            detail = (
-                f"The bot is not a member of guild {self._guild_id}, or the ID is wrong. "
-                "Invite the bot to that server with the OAuth2 URL from the Developer Portal."
+        missing: list[int] = []
+        for guild_id in self._guild_ids:
+            self._emit_guild(guild_id)
+            if client.get_guild(guild_id) is None:
+                missing.append(guild_id)
+        new_missing = [gid for gid in missing if gid not in self._reported_missing]
+        if new_missing:
+            self._reported_missing.update(new_missing)
+            ids = ", ".join(str(g) for g in new_missing)
+            app_id = client.application_id or (client.user.id if client.user else "YOUR_CLIENT_ID")
+            self._emit_error(
+                ErrorKind.GUILD_NOT_FOUND,
+                f"The bot is not a member of server {ids}. Invite it with: {invite_url(app_id)}",
             )
-            try:
-                fetched = await client.fetch_guild(self._guild_id)
-                detail = f"Guild '{fetched.name}' is not available to this bot's gateway session yet."
-            except (discord.Forbidden, discord.NotFound):
-                pass
-            except discord.HTTPException as exc:
-                detail = describe_exception(exc)[1]
-            self._set_guild_ready(False)
-            self._set_state(ConnectionState.ERROR, "Guild not found")
-            self._emit_error(ErrorKind.GUILD_NOT_FOUND, detail)
-            self.guild_changed.emit(None)
-            return
+        self._update_connection_summary()
 
-        if guild.unavailable:
-            self._set_guild_ready(False)
-            self._set_state(ConnectionState.ERROR, "Guild temporarily unavailable")
-            return
-
-        self._set_state(ConnectionState.CONNECTED, guild.name)
-        self._emit_guild_info()
-        self._set_guild_ready(True)
+    async def _wait_for_wake(self, timeout: float | None) -> None:
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        self._wake.clear()
 
     async def _run_forever(self) -> None:
         backoff = BACKOFF_INITIAL
@@ -405,8 +483,11 @@ class DiscordService(QObject):
 
             self._wake.clear()
             self._set_state(ConnectionState.CONNECTING, "Connecting to Discord…")
+            for gid in self._guild_ids:
+                self.guild_status_changed.emit(gid, GuildStatus.PENDING.value, "Connecting…", None)
             client = self._make_client()
             self._client = client
+            self._last_chunk_at.clear()
             wait_for_user = False
             connected_at = time.monotonic()
             try:
@@ -425,7 +506,7 @@ class DiscordService(QObject):
                 self._set_state(state, message)
                 self._emit_error(kind, message)
             finally:
-                self._set_guild_ready(False)
+                self._set_ready(False)
                 if not client.is_closed():
                     try:
                         await client.close()
@@ -453,8 +534,28 @@ class DiscordService(QObject):
             backoff = min(BACKOFF_MAX, backoff * 2)
 
 
-async def test_connection(token: str, guild_id: int | None) -> ConnectionTestResult:
-    """Validate credentials over REST only (no gateway session is opened)."""
+async def _rest_client(token: str) -> discord.Client:
+    client = discord.Client(intents=discord.Intents.none())
+    await client.login(token)
+    return client
+
+
+async def list_bot_guilds(token: str) -> list[BotGuild]:
+    """Servers the bot has been invited to (REST: GET /users/@me/guilds)."""
+    client = await _rest_client(token.strip())
+    try:
+        guilds = [
+            BotGuild(g.id, g.name, g.approximate_member_count)
+            async for g in client.fetch_guilds(limit=None, with_counts=True)
+        ]
+        guilds.sort(key=lambda g: g.name.casefold())
+        return guilds
+    finally:
+        await client.close()
+
+
+async def test_connection(token: str, guild_ids: tuple[int, ...]) -> ConnectionTestResult:
+    """Validate credentials and every configured server over REST (no gateway session)."""
     token = token.strip()
     if not token:
         return ConnectionTestResult(False, "Bot token required", ["Enter a bot token first."], ErrorKind.MISSING_TOKEN)
@@ -468,36 +569,36 @@ async def test_connection(token: str, guild_id: int | None) -> ConnectionTestRes
 
         app_info = await client.application_info()
         flags = app_info.flags
-        has_members_intent = bool(flags.gateway_guild_members or flags.gateway_guild_members_limited)
-        if not has_members_intent:
+        if not (flags.gateway_guild_members or flags.gateway_guild_members_limited):
             return ConnectionTestResult(
                 False,
                 "Server Members Intent is disabled",
-                details
-                + [
-                    "Enable 'Server Members Intent' in the Developer Portal → Bot → Privileged Gateway Intents.",
-                ],
+                details + ["Enable 'Server Members Intent' in the Developer Portal → Bot → Privileged Gateway Intents."],
                 ErrorKind.MISSING_INTENT,
             )
         details.append("Server Members Intent is enabled")
 
-        if guild_id is None:
-            return ConnectionTestResult(False, "Guild ID required", details + ["Enter the Server (Guild) ID."], ErrorKind.GUILD_NOT_FOUND)
-        try:
-            guild = await client.fetch_guild(guild_id, with_counts=True)
-        except (discord.Forbidden, discord.NotFound):
+        if not guild_ids:
+            return ConnectionTestResult(
+                False, "Server ID required", details + ["Enter at least one Server (Guild) ID."], ErrorKind.GUILD_NOT_FOUND
+            )
+        missing = 0
+        for guild_id in guild_ids:
+            try:
+                guild = await client.fetch_guild(guild_id, with_counts=True)
+                count = guild.approximate_member_count
+                details.append(f"✓ {guild.name} ({guild_id})" + (f" · ~{count:,} members" if count else ""))
+            except (discord.Forbidden, discord.NotFound):
+                missing += 1
+                details.append(f"✗ {guild_id}: the bot is not in this server, or the ID is wrong")
+        if missing:
+            details.append(f"Invite the bot (scope=bot): {invite_url(app_info.id)}")
             return ConnectionTestResult(
                 False,
-                "Bot is not in that server",
-                details
-                + [
-                    f"Guild {guild_id} does not exist or the bot has not been invited to it.",
-                    "Invite the bot with the OAuth2 URL Generator (scope: bot).",
-                ],
+                f"{missing} of {len(guild_ids)} server{'s' if len(guild_ids) != 1 else ''} not reachable",
+                details,
                 ErrorKind.GUILD_NOT_FOUND,
             )
-        count = guild.approximate_member_count
-        details.append(f"Guild: {guild.name}" + (f" · ~{count:,} members" if count else ""))
         return ConnectionTestResult(True, "Connection successful", details)
     except Exception as exc:  # noqa: BLE001
         kind, message = describe_exception(exc)

@@ -1,20 +1,23 @@
-"""Periodic member scanner.
+"""Periodic, per-server member scanner.
 
-Lifecycle (default interval 60 s, never less):
+Each cycle (default every 60 s, never less) syncs every configured server
+*separately*, one after another:
 
-1. Wait until the Discord connection reports the configured guild as ready.
-2. Make sure the member cache is complete (gateway chunking / REST paging).
-3. Walk every member, skipping bots if configured, and keep those whose
-   ``joined_at`` is strictly before the cutoff (both are aware UTC datetimes).
-4. For each match, compute the channels the member can view using Discord's
-   permission model (role + overwrite resolution) with a per-scan cache keyed
-   by the member's permission-relevant signature.
-5. Upsert matches into SQLite keyed by (guild, Discord user ID) - existing rows
-   are refreshed, never duplicated - and record the scan in scan_history.
-6. Emit signals so the UI can update incrementally and notifications can fire.
+1. Wait until the Discord connection is ready. Servers the bot is not in are
+   skipped and reported, and never block the other servers.
+2. Make sure that server's member cache is complete (gateway chunking / REST
+   paging). A manual refresh re-requests the list, throttled per server.
+3. Build a snapshot of every member of *that* guild object: username, display
+   name, user ID, joined date, bot flag, roles and viewable channels.
+4. Upsert the snapshots into SQLite under that server's guild_id, keyed by
+   (guild_id, Discord user ID). Rows are refreshed, never duplicated, and
+   members who left are flagged.
+5. Count members that joined before the cutoff (both aware UTC datetimes).
+   New ones feed the activity log and desktop notifications.
 
-The next automatic scan is scheduled ``interval`` seconds after the previous
-scan *started*; "Scan Now" runs immediately and restarts the countdown.
+The next automatic cycle is scheduled ``interval`` seconds after the previous
+cycle *started*. "Scan Now" / "Refresh all" run a full cycle immediately;
+"Refresh server" syncs a single server without changing the schedule.
 """
 
 from __future__ import annotations
@@ -30,12 +33,20 @@ from PySide6.QtCore import QObject, Signal
 from app.config import MIN_SCAN_INTERVAL, Settings
 from app.database import Database, DatabaseError
 from app.discord_service import DiscordService, describe_exception
-from app.models import ChannelInfo, ErrorKind, MemberSnapshot, ScanResult
+from app.models import (
+    ChannelInfo,
+    ErrorKind,
+    MemberSnapshot,
+    RoleInfo,
+    ScanResult,
+    channel_set_key,
+    channels_to_json,
+)
 from app.utils import ensure_utc, plural, utcnow
 
 log = logging.getLogger(__name__)
 
-MANUAL_SCAN_COOLDOWN = 5.0
+MANUAL_SCAN_COOLDOWN = 3.0
 YIELD_EVERY = 250
 
 
@@ -54,7 +65,7 @@ def _channel_kind(channel: discord.abc.GuildChannel) -> str | None:
 
 
 class ChannelAccessResolver:
-    """Computes which guild channels a member can view, with caching.
+    """Computes which channels of ONE guild a member can view, with caching.
 
     Channel permissions depend on the member's roles, member-specific
     overwrites, ownership and timeout state. Members sharing the same
@@ -72,9 +83,10 @@ class ChannelAccessResolver:
             for target in channel.overwrites:
                 if not isinstance(target, discord.Role):
                     self._member_overwrite_ids.add(target.id)
-        self._cache: dict[tuple, list[ChannelInfo]] = {}
+        self._cache: dict[tuple, tuple[list[ChannelInfo], str]] = {}
+        self.channel_sets: dict[str, str] = {}  # set key -> channels JSON (stored once per distinct set)
 
-    def accessible_channels(self, member: discord.Member) -> list[ChannelInfo]:
+    def accessible_channels(self, member: discord.Member) -> tuple[list[ChannelInfo], str]:
         key = (
             tuple(sorted(role.id for role in member.roles)),
             member.id if member.id in self._member_overwrite_ids else None,
@@ -91,8 +103,10 @@ class ChannelAccessResolver:
                     result.append(ChannelInfo(channel.id, channel.name, _channel_kind(channel) or "text"))
             except Exception as exc:  # noqa: BLE001 - one bad channel must not break the scan
                 log.debug("Permission check failed for channel %s: %s", channel.id, exc)
-        self._cache[key] = result
-        return result
+        set_key = channel_set_key(result)
+        self.channel_sets.setdefault(set_key, channels_to_json(result))
+        self._cache[key] = (result, set_key)
+        return result, set_key
 
 
 def _username(member: discord.Member) -> str:
@@ -109,9 +123,18 @@ def _avatar_url(member: discord.Member) -> str | None:
         return None
 
 
+def _roles(member: discord.Member) -> list[RoleInfo]:
+    roles = [r for r in member.roles if not r.is_default()]
+    roles.sort(key=lambda r: r.position, reverse=True)
+    return [RoleInfo(r.id, r.name, r.color.value, r.position) for r in roles]
+
+
 class Scanner(QObject):
-    scan_started = Signal(bool)                  # manual?
-    scan_finished = Signal(object)               # ScanResult
+    cycle_started = Signal(bool)                 # manual?
+    guild_scan_started = Signal(object)             # guild id
+    guild_progress = Signal(object, int, int)       # guild id, loaded, total
+    guild_scan_finished = Signal(object)         # ScanResult (one server)
+    cycle_finished = Signal(object)              # list[ScanResult]
     schedule_changed = Signal(object)            # next scan monotonic time | None
     paused_changed = Signal(bool)
     activity = Signal(str, str)                  # event_type, message
@@ -126,11 +149,13 @@ class Scanner(QObject):
         self._running = False
         self._scan_lock = asyncio.Lock()
         self._wake = asyncio.Event()
-        self._manual_requested = False
+        self._requested: set[int] = set()
+        self._requested_all = False
         self._task: asyncio.Task | None = None
         self._next_scan_at: float | None = None
-        self._last_manual = 0.0
-        self.last_result: ScanResult | None = None
+        self._last_manual: dict[object, float] = {}
+        self._scanning_guild: int | None = None
+        self.last_results: dict[int, ScanResult] = {}
 
     # ----------------------------------------------------------------- public
 
@@ -143,8 +168,8 @@ class Scanner(QObject):
         return self._scan_lock.locked()
 
     @property
-    def next_scan_at(self) -> float | None:
-        return self._next_scan_at
+    def scanning_guild(self) -> int | None:
+        return self._scanning_guild
 
     def seconds_until_next(self) -> float | None:
         if self._paused or self._next_scan_at is None:
@@ -154,6 +179,7 @@ class Scanner(QObject):
     def update_settings(self, settings: Settings) -> None:
         interval_changed = settings.scan_interval != self._settings.scan_interval
         self._settings = settings
+        self.last_results = {g: r for g, r in self.last_results.items() if g in settings.guild_ids}
         if interval_changed and self._next_scan_at is not None:
             self._set_next(time.monotonic() + settings.scan_interval)
             self._wake.set()
@@ -190,13 +216,20 @@ class Scanner(QObject):
                 self._set_next(time.monotonic())
             self._wake.set()
 
-    def request_scan(self) -> bool:
-        """Scan immediately. Returns False if throttled or already scanning."""
+    def request_scan(self, guild_ids: list[int] | None = None) -> bool:
+        """Refresh now: every server (``None``) or only the given ones.
+
+        Returns False if the same request was made a moment ago.
+        """
+        key: object = "all" if guild_ids is None else tuple(sorted(guild_ids))
         now = time.monotonic()
-        if self.is_scanning or now - self._last_manual < MANUAL_SCAN_COOLDOWN:
+        if now - self._last_manual.get(key, 0.0) < MANUAL_SCAN_COOLDOWN:
             return False
-        self._last_manual = now
-        self._manual_requested = True
+        self._last_manual[key] = now
+        if guild_ids is None:
+            self._requested_all = True
+        else:
+            self._requested.update(guild_ids)
         self._wake.set()
         return True
 
@@ -214,32 +247,42 @@ class Scanner(QObject):
         self._wake.clear()
 
     async def _loop(self) -> None:
-        self._set_next(time.monotonic() + 1.0)  # first scan shortly after the guild is ready
+        self._set_next(time.monotonic() + 1.0)  # first cycle shortly after connecting
         while self._running:
-            manual = self._manual_requested
+            manual = self._requested_all or bool(self._requested)
             due = self._next_scan_at is not None and time.monotonic() >= self._next_scan_at
 
             if manual or (due and not self._paused):
-                self._manual_requested = False
+                configured = list(self._settings.guild_ids)
+                full_cycle = not manual or self._requested_all
+                if full_cycle:
+                    guild_ids = configured
+                else:
+                    guild_ids = [g for g in configured if g in self._requested]
+                self._requested.clear()
+                self._requested_all = False
+
                 if not self._discord.is_ready:
                     if manual:
                         self.error_occurred.emit(
-                            ErrorKind.DISCONNECTED.value, "Cannot scan: Discord is not connected to the guild yet."
+                            ErrorKind.DISCONNECTED.value, "Cannot refresh: Discord is not connected yet."
                         )
-                    # Retry shortly once the connection is back; don't count as a scan.
-                    self._set_next(time.monotonic() + 5.0)
+                    if full_cycle:
+                        self._set_next(time.monotonic() + 5.0)
                     await self._sleep_until_wake(5.0)
                     continue
 
                 started = time.monotonic()
-                self._set_next(started + self._settings.scan_interval)
-                await self.run_scan(manual=manual)
-                # Fixed cadence measured from the start of this scan, never below the minimum
-                # interval. If the scan itself overran the interval, leave a short breather.
-                next_at = started + max(MIN_SCAN_INTERVAL, self._settings.scan_interval)
-                if next_at <= time.monotonic():
-                    next_at = time.monotonic() + 5.0
-                self._set_next(next_at)
+                if full_cycle:
+                    self._set_next(started + self._settings.scan_interval)
+                await self.run_cycle(guild_ids, manual=manual, force=manual)
+                if full_cycle:
+                    # Fixed cadence measured from the start of this cycle, never below the
+                    # minimum interval. If the cycle overran the interval, leave a short breather.
+                    next_at = started + max(MIN_SCAN_INTERVAL, self._settings.scan_interval)
+                    if next_at <= time.monotonic():
+                        next_at = time.monotonic() + 5.0
+                    self._set_next(next_at)
                 continue
 
             timeout = None
@@ -247,112 +290,152 @@ class Scanner(QObject):
                 timeout = max(0.05, self._next_scan_at - time.monotonic())
             await self._sleep_until_wake(timeout)
 
-    async def run_scan(self, manual: bool = False) -> ScanResult:
+    async def run_cycle(self, guild_ids: list[int], manual: bool = False, force: bool = False) -> list[ScanResult]:
         async with self._scan_lock:
-            self.scan_started.emit(manual)
-            started_at = utcnow()
-            t0 = time.perf_counter()
-            guild = self._discord.guild
-            settings = self._settings
-            try:
-                if guild is None:
-                    raise RuntimeError("Guild is not available.")
-                result = await self._scan_guild(guild, settings, started_at, t0, manual)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                if isinstance(exc, DatabaseError):
-                    kind, message = ErrorKind.DATABASE, f"Database error: {exc}"
-                elif isinstance(exc, RuntimeError):
-                    kind, message = ErrorKind.SCAN, str(exc)
-                else:
-                    kind, message = describe_exception(exc)
-                log.exception("Scan failed")
-                result = ScanResult(
-                    started_at=started_at,
-                    completed_at=utcnow(),
-                    members_checked=0,
-                    matches_found=0,
-                    new_matches=0,
-                    duration_ms=int((time.perf_counter() - t0) * 1000),
-                    status="error",
-                    error_message=message,
-                    manual=manual,
-                )
-                self.error_occurred.emit(kind.value, message)
-                try:
-                    self._db.add_scan(self._discord.guild_id, result)
-                except DatabaseError:
-                    pass
+            self.cycle_started.emit(manual)
+            results: list[ScanResult] = []
+            for guild_id in guild_ids:
+                if guild_id not in self._settings.guild_ids:
+                    continue  # removed from settings while queued
+                results.append(await self.scan_guild(guild_id, manual=manual, force=force))
+            self.cycle_finished.emit(results)
+            return results
 
-            self.last_result = result
-            self.scan_finished.emit(result)
+    async def scan_guild(self, guild_id: int, manual: bool = False, force: bool = False) -> ScanResult:
+        """Sync one server. Never touches rows of any other guild."""
+        started_at = utcnow()
+        t0 = time.perf_counter()
+        guild = self._discord.guild(guild_id)
+        settings = self._settings
+        if guild is None:
+            result = ScanResult(
+                guild_id=guild_id, guild_name="", started_at=started_at, completed_at=utcnow(),
+                members_checked=0, members_loaded=0, matches_found=0, new_matches=0,
+                duration_ms=0, status="skipped",
+                error_message="The bot is not in this server or it is unavailable.",
+                manual=manual,
+            )
+            self.guild_scan_finished.emit(result)
             return result
 
-    async def _scan_guild(
-        self, guild: discord.Guild, settings: Settings, started_at: datetime, t0: float, manual: bool
+        self._scanning_guild = guild_id
+        self.guild_scan_started.emit(guild_id)
+        try:
+            result = await self._scan(guild, settings, started_at, t0, manual, force)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, DatabaseError):
+                kind, message = ErrorKind.DATABASE, f"Database error: {exc}"
+            else:
+                kind, message = describe_exception(exc)
+            log.exception("Sync failed for guild %s", guild_id)
+            result = ScanResult(
+                guild_id=guild_id, guild_name=guild.name, started_at=started_at, completed_at=utcnow(),
+                members_checked=0, members_loaded=0, matches_found=0, new_matches=0,
+                duration_ms=int((time.perf_counter() - t0) * 1000), status="error",
+                error_message=message, manual=manual,
+            )
+            self.error_occurred.emit(kind.value, f"{guild.name}: {message}")
+            try:
+                self._db.add_scan(result)
+            except DatabaseError:
+                pass
+        finally:
+            self._scanning_guild = None
+
+        self.last_results[guild_id] = result
+        self.guild_scan_finished.emit(result)
+        return result
+
+    async def _scan(
+        self,
+        guild: discord.Guild,
+        settings: Settings,
+        started_at: datetime,
+        t0: float,
+        manual: bool,
+        force: bool,
     ) -> ScanResult:
         cutoff = ensure_utc(settings.cutoff)
-        members, complete = await self._discord.ensure_member_cache(guild)
+        gid = guild.id
+
+        def progress(loaded: int, total: int) -> None:
+            self.guild_progress.emit(gid, loaded, total)
+
+        members, complete = await self._discord.ensure_member_cache(guild, force=force, progress=progress)
+        progress(len(members), guild.member_count or len(members))
         resolver = ChannelAccessResolver(guild)
 
+        snapshots: list[MemberSnapshot] = []
+        qualifying_ids: set[int] = set()
         checked = 0
         skipped = 0
-        matches: list[MemberSnapshot] = []
         for index, member in enumerate(members):
             if index and index % YIELD_EVERY == 0:
                 await asyncio.sleep(0)  # keep the Qt event loop responsive
             try:
-                if settings.ignore_bots and member.bot:
-                    continue
-                checked += 1
-                joined_at = member.joined_at
-                if joined_at is None:
-                    continue  # Discord may omit joined_at (e.g. guest members)
-                joined_at = ensure_utc(joined_at)
-                if joined_at >= cutoff:
-                    continue
-                matches.append(
+                if member.guild.id != gid:
+                    continue  # defensive: never mix members of different servers
+                joined_at = ensure_utc(member.joined_at) if member.joined_at else None
+                channels, set_key = resolver.accessible_channels(member)
+                snapshots.append(
                     MemberSnapshot(
                         user_id=member.id,
-                        guild_id=guild.id,
+                        guild_id=gid,
                         username=_username(member),
                         display_name=member.display_name,
                         avatar_url=_avatar_url(member),
                         joined_at=joined_at,
-                        channels=resolver.accessible_channels(member),
+                        is_bot=member.bot,
+                        roles=_roles(member),
+                        channels=channels,
+                        channel_key=set_key,
                     )
                 )
+                if settings.ignore_bots and member.bot:
+                    continue
+                checked += 1
+                if joined_at is not None and joined_at < cutoff:
+                    qualifying_ids.add(member.id)
             except Exception as exc:  # noqa: BLE001 - never fail a whole scan for one member
                 skipped += 1
-                log.warning("Skipping member %s: %s", getattr(member, "id", "?"), exc)
+                log.warning("Skipping member %s of guild %s: %s", getattr(member, "id", "?"), gid, exc)
 
         seen_at = utcnow()
-        upsert = await asyncio.to_thread(self._db.upsert_members, guild.id, matches, seen_at)
+        self._db.upsert_guild(gid, guild.name, guild.member_count, None)
+        upsert = await asyncio.to_thread(self._db.upsert_members, gid, snapshots, seen_at, resolver.channel_sets)
         if complete:
-            await asyncio.to_thread(self._db.mark_not_present, guild.id, {m.user_id for m in matches})
+            await asyncio.to_thread(self._db.mark_not_present, gid, {s.user_id for s in snapshots})
 
-        new_records = self._db.get_members_by_ids(guild.id, upsert.new_user_ids)
+        new_qualifying = [uid for uid in upsert.new_user_ids if uid in qualifying_ids]
+        new_records = self._db.get_members_by_ids(gid, new_qualifying)
         new_records.sort(key=lambda r: r.joined_at or seen_at)
         result = ScanResult(
+            guild_id=gid,
+            guild_name=guild.name,
             started_at=started_at,
             completed_at=utcnow(),
             members_checked=checked,
-            matches_found=len(matches),
-            new_matches=len(upsert.new_user_ids),
+            members_loaded=len(snapshots),
+            matches_found=len(qualifying_ids),
+            new_matches=len(new_qualifying),
             duration_ms=int((time.perf_counter() - t0) * 1000),
             status="success",
             new_members=new_records,
             manual=manual,
         )
-        self._db.add_scan(guild.id, result)
+        self._db.add_scan(result)
 
         feed_limit = 20
         for record in new_records[:feed_limit]:
-            self.activity.emit("found", f"Found {record.username}")
+            self.activity.emit("found", f"Found {record.username} in {guild.name}")
         if len(new_records) > feed_limit:
-            self.activity.emit("found", f"Found {len(new_records) - feed_limit:,} more members")
-        summary = f"Scan completed - {checked:,} checked, {plural(len(matches), 'match', 'es')}"
+            self.activity.emit("found", f"Found {len(new_records) - feed_limit:,} more members in {guild.name}")
+        summary = (
+            f"{guild.name}: synced {len(snapshots):,} members, "
+            f"{plural(len(qualifying_ids), 'match', 'es')} before cutoff"
+        )
         if skipped:
             summary += f", {skipped} skipped"
         if not complete:

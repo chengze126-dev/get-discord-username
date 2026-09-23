@@ -299,6 +299,17 @@ QPushButton#IconButton {{
 QPushButton#IconButton:hover {{ background: {p.hover}; border-color: {p.border}; }}
 
 /* ------------------------------------------------------------- inputs */
+QPlainTextEdit#GuildIds {{
+    background: {p.surface_alt};
+    border: 1px solid {p.border};
+    border-radius: 10px;
+    padding: 5px 7px;
+    color: {p.text};
+    font-family: {", ".join(f'"{f}"' for f in MONO_FAMILIES)};
+    font-size: 12px;
+    selection-background-color: {p.accent};
+}}
+QPlainTextEdit#GuildIds:focus {{ border-color: {p.accent}; background: {p.surface}; }}
 QLineEdit, QSpinBox, QDateTimeEdit, QComboBox {{
     background: {p.surface_alt};
     border: 1px solid {p.border};

@@ -20,7 +20,7 @@ from ui.dashboard import ActivityDelegate, ActivityModel, PageHeader
 
 
 class ScanHistoryModel(QAbstractTableModel):
-    HEADERS = ["Started", "Status", "Checked", "Matches", "New", "Duration", "Details"]
+    HEADERS = ["Started", "Server", "Status", "Loaded", "Checked", "Matches", "New", "Duration", "Details"]
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -44,9 +44,12 @@ class ScanHistoryModel(QAbstractTableModel):
         col = index.column()
         if role == Qt.ItemDataRole.DisplayRole:
             started = from_iso(row["started_at"])
+            server = row.get("guild_name") or (f"Server {row['guild_id']}" if row.get("guild_id") else "—")
             values = [
                 f"{started.astimezone().strftime('%b %d')}  {format_clock(started)}" if started else "—",
+                server,
                 row["status"].capitalize(),
+                f"{row.get('members_loaded') or 0:,}",
                 f"{row['members_checked']:,}",
                 f"{row['matches_found']:,}",
                 f"{row['new_matches']:,}",
@@ -54,8 +57,11 @@ class ScanHistoryModel(QAbstractTableModel):
                 row["error_message"] or "",
             ]
             return values[col]
-        if role == Qt.ItemDataRole.ToolTipRole and col == 6:
-            return row["error_message"] or None
+        if role == Qt.ItemDataRole.ToolTipRole:
+            if col == 8:
+                return row["error_message"] or None
+            if col == 1 and row.get("guild_id"):
+                return f"Guild ID {row['guild_id']}"
         return None
 
     def set_rows(self, rows) -> None:
@@ -71,7 +77,7 @@ class ActivityPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(20)
-        layout.addWidget(PageHeader("Activity", "The latest 100 events and recent scan history"))
+        layout.addWidget(PageHeader("Activity", "The latest 100 events and the sync history of every server"))
 
         body = QHBoxLayout()
         body.setSpacing(14)
@@ -118,9 +124,9 @@ class ActivityPage(QWidget):
         header = table.horizontalHeader()
         header.setHighlightSections(False)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        for col in range(6):
+        for col in range(8):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(8, QHeaderView.ResizeMode.Stretch)
         history_layout.addWidget(table, 1)
         body.addWidget(history_card, 6)
 

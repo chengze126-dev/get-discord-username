@@ -22,7 +22,7 @@ from app.models import ActivityEvent
 from app.utils import format_clock
 from ui.components.icons import themed_icon
 from ui.components.stat_card import StatCard
-from ui.member_table import MemberTableModel, MemberTableSection
+from ui.member_table import COL_CHANNELS, COL_JOINED, COL_NO, COL_USER, MemberSection, MemberTreeModel
 from ui.theme import FONT_FAMILIES, MONO_FAMILIES, Palette, ThemeManager
 
 _EVENT_TOKEN = {
@@ -119,11 +119,12 @@ class ScanStatusPanel(QFrame):
     """Last Scan / Next Scan / Duration / Checked / Matches / Connection."""
 
     FIELDS = [
-        ("last", "Last scan"),
-        ("next", "Next scan"),
-        ("duration", "Scan duration"),
+        ("last", "Last sync"),
+        ("next", "Next sync"),
+        ("duration", "Sync duration"),
         ("checked", "Members checked"),
         ("matches", "Matches found"),
+        ("servers", "Servers"),
         ("connection", "Connection"),
     ]
 
@@ -223,7 +224,7 @@ class DashboardPage(QWidget):
 
     def __init__(
         self,
-        member_model: MemberTableModel,
+        member_model: MemberTreeModel,
         activity_model: ActivityModel,
         avatars: AvatarCache,
         parent: QWidget | None = None,
@@ -259,7 +260,14 @@ class DashboardPage(QWidget):
 
         body = QHBoxLayout()
         body.setSpacing(14)
-        self.members = MemberTableSection(member_model, avatars, "Members Found")
+        # Only members who joined before the cutoff, grouped by server.
+        self.members = MemberSection(
+            member_model,
+            avatars,
+            "Members Found",
+            columns=[COL_NO, COL_USER, COL_JOINED, COL_CHANNELS],
+            qualifying_only=True,
+        )
         self.activity = ActivityFeedCard(activity_model)
         body.addWidget(self.members, 1)
         body.addWidget(self.activity)

@@ -102,7 +102,8 @@ class NotificationManager(QObject):
             name = record.username
             if record.shows_display_name:
                 name = f"{record.username} ({record.display_name})"
-            body = f"Username: {name}\nJoined: {joined}\nChannels: {record.channel_count}"
+            server = record.guild_name or f"Server {record.guild_id}"
+            body = f"Server: {server}\nUsername: {name}\nJoined: {joined}\nChannels: {record.channel_count}"
             self._queue.append(_Pending(f"{APP_NAME} · New member found", body))
         remaining = len(records) - len(individual)
         if remaining > 0:

@@ -1,11 +1,12 @@
-"""Find the servers your bot is in and write the chosen ID to .env as DISCORD_GUILD_ID.
+"""Find the servers your bot is in and write the chosen IDs to .env as DISCORD_GUILD_IDS.
 
 Uses the official Bot API (GET /users/@me/guilds), so it only lists servers
 the bot has been invited to. No gateway connection is opened.
 
 Usage:
-    python set_guild_id.py                 # list servers and pick one
-    python set_guild_id.py --name "Dev"    # pick the server whose name contains "Dev"
+    python set_guild_id.py                 # list servers and pick one or more (e.g. "1,3" or "a" for all)
+    python set_guild_id.py --all           # select every server the bot is in
+    python set_guild_id.py --name "Dev"    # select the servers whose name contains "Dev"
     python set_guild_id.py --list          # only list servers, don't change .env
 
 Token lookup: DISCORD_BOT_TOKEN in .env / environment, then the OS credential
@@ -23,7 +24,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
-KEY = "DISCORD_GUILD_ID"
+KEY = "DISCORD_GUILD_IDS"
+LEGACY_KEY = "DISCORD_GUILD_ID"
 
 sys.path.insert(0, str(ROOT))
 
@@ -60,37 +62,45 @@ async def fetch_guilds(token: str) -> list[tuple[int, str, int | None]]:
         await client.close()
 
 
-def write_guild_id(guild_id: int) -> None:
-    """Set DISCORD_GUILD_ID in .env, keeping every other line unchanged."""
-    from app.config import write_env_value
+def write_guild_ids(guild_ids: list[int]) -> None:
+    """Set DISCORD_GUILD_IDS in .env (and clear the old single-server key), keeping other lines."""
+    from app.config import format_guild_ids, write_env_value
 
-    write_env_value(KEY, str(guild_id), ENV_PATH)
+    write_env_value(KEY, format_guild_ids(guild_ids), ENV_PATH)
+    if os.environ.get(LEGACY_KEY, "").strip():
+        write_env_value(LEGACY_KEY, "", ENV_PATH)
 
 
-def choose(guilds: list[tuple[int, str, int | None]], name: str | None) -> tuple[int, str, int | None] | None:
+Guild = tuple[int, str, int | None]
+
+
+def choose(guilds: list[Guild], name: str | None, select_all: bool) -> list[Guild]:
+    if select_all:
+        return guilds
     if name:
         matches = [g for g in guilds if name.casefold() in g[1].casefold()]
-        if len(matches) == 1:
-            return matches[0]
         if not matches:
             print(f'No server name contains "{name}".')
-            return None
-        print(f'Several servers match "{name}"; pick one:')
-        guilds = matches
+        return matches
     if len(guilds) == 1:
-        return guilds[0]
+        return guilds
     while True:
-        answer = input(f"Enter a number 1-{len(guilds)} (or q to quit): ").strip().lower()
+        answer = input(f"Enter numbers 1-{len(guilds)} separated by commas, 'a' for all, or q to quit: ").strip().lower()
         if answer in ("q", "quit", ""):
-            return None
-        if answer.isdigit() and 1 <= int(answer) <= len(guilds):
-            return guilds[int(answer) - 1]
+            return []
+        if answer in ("a", "all"):
+            return guilds
+        parts = [p.strip() for p in answer.replace(" ", ",").split(",") if p.strip()]
+        if parts and all(p.isdigit() and 1 <= int(p) <= len(guilds) for p in parts):
+            picked = list(dict.fromkeys(int(p) for p in parts))
+            return [guilds[i - 1] for i in picked]
         print("Invalid choice.")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--name", help="select the server whose name contains this text")
+    parser.add_argument("--name", help="select the servers whose name contains this text")
+    parser.add_argument("--all", action="store_true", help="select every server the bot is in")
     parser.add_argument("--list", action="store_true", help="only list servers")
     args = parser.parse_args()
 
@@ -128,15 +138,16 @@ def main() -> int:
     if args.list:
         return 0
 
-    picked = choose(guilds, args.name)
-    if picked is None:
+    picked = choose(guilds, args.name, args.all)
+    if not picked:
         print(".env was not changed.")
         return 1
 
-    gid, name, _ = picked
-    write_guild_id(gid)
-    print(f'Saved {KEY}={gid} ("{name}") to {ENV_PATH}')
-    print("Restart the app to use this server. The Settings page will then show this ID.")
+    write_guild_ids([gid for gid, _name, _count in picked])
+    print(f"Saved {KEY}={','.join(str(g[0]) for g in picked)} to {ENV_PATH}")
+    for gid, name, _count in picked:
+        print(f"  • {name} ({gid})")
+    print("Restart the app to use these servers. The Settings page will then show them.")
     return 0
 
 

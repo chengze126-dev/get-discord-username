@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import html
+
 from PySide6.QtCore import QEasingCurve, QEvent, QPoint, QPropertyAnimation, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter
 from PySide6.QtWidgets import (
@@ -144,18 +146,27 @@ class MemberDetailsDrawer(QFrame):
         grid.setContentsMargins(16, 14, 16, 14)
         grid.setHorizontalSpacing(18)
         grid.setVerticalSpacing(14)
+        self._f_server = _Field("Server")
+        self._f_guild = _Field("Guild ID", mono=True)
         self._f_display = _Field("Display name")
         self._f_id = _Field("Discord user ID", mono=True)
+        self._f_bot = _Field("Account type")
+        self._f_count = _Field("Accessible channels")
         self._f_joined = _Field("Server joined date")
         self._f_first = _Field("First detected")
         self._f_last = _Field("Last seen")
-        self._f_count = _Field("Accessible channels")
-        grid.addWidget(self._f_display, 0, 0)
-        grid.addWidget(self._f_id, 0, 1)
-        grid.addWidget(self._f_joined, 1, 0, 1, 2)
-        grid.addWidget(self._f_first, 2, 0, 1, 2)
-        grid.addWidget(self._f_last, 3, 0, 1, 2)
-        grid.addWidget(self._f_count, 4, 0, 1, 2)
+        self._f_roles = _Field("Roles")
+        self._f_roles.value.setTextFormat(Qt.TextFormat.RichText)
+        grid.addWidget(self._f_server, 0, 0)
+        grid.addWidget(self._f_guild, 0, 1)
+        grid.addWidget(self._f_display, 1, 0)
+        grid.addWidget(self._f_id, 1, 1)
+        grid.addWidget(self._f_bot, 2, 0)
+        grid.addWidget(self._f_count, 2, 1)
+        grid.addWidget(self._f_joined, 3, 0, 1, 2)
+        grid.addWidget(self._f_first, 4, 0, 1, 2)
+        grid.addWidget(self._f_last, 5, 0, 1, 2)
+        grid.addWidget(self._f_roles, 6, 0, 1, 2)
         layout.addWidget(info)
 
         channels_header = QHBoxLayout()
@@ -205,8 +216,9 @@ class MemberDetailsDrawer(QFrame):
         return self._open
 
     @property
-    def current_user_id(self) -> int | None:
-        return self._record.user_id if self._record else None
+    def current_key(self) -> tuple[int, int] | None:
+        """(guild_id, user_id) of the member shown - the same user can be in several servers."""
+        return (self._record.guild_id, self._record.user_id) if self._record else None
 
     def show_member(self, record: MemberRecord) -> None:
         self._populate(record)
@@ -227,7 +239,7 @@ class MemberDetailsDrawer(QFrame):
         self.setFocus()
 
     def refresh(self, record: MemberRecord) -> None:
-        if self._record is not None and record.user_id == self._record.user_id:
+        if self._record is not None and (record.guild_id, record.user_id) == self.current_key:
             self._populate(record)
 
     def close_drawer(self) -> None:
@@ -252,7 +264,18 @@ class MemberDetailsDrawer(QFrame):
         if record.in_guild:
             self._status.setText(f"Member since {format_long_date(record.joined_at)}")
         else:
-            self._status.setText("Not in server / no longer qualifying")
+            self._status.setText("No longer in this server")
+        self._f_server.value.setText(record.guild_name or f"Server {record.guild_id}")
+        self._f_guild.value.setText(str(record.guild_id))
+        self._f_bot.value.setText("Bot account" if record.is_bot else "User account")
+        if record.roles:
+            chips = []
+            for role in record.roles:
+                color = role.hex_color or p.text_faint
+                chips.append(f"<span style='color:{color}'>●</span>&nbsp;{html.escape(role.name)}")
+            self._f_roles.value.setText("&nbsp;&nbsp; ".join(chips))
+        else:
+            self._f_roles.value.setText("No roles")
         self._f_display.value.setText(record.display_name or record.username)
         self._f_id.value.setText(str(record.user_id))
         self._f_joined.value.setText(format_precise(record.joined_at))
