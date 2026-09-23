@@ -62,7 +62,7 @@ class AppController(QObject):
     paused_changed = Signal(bool)
     settings_changed = Signal(object)           # Settings
     test_result = Signal(object)                # ConnectionTestResult
-    bot_guilds_result = Signal(object)          # list[BotGuild] or error string
+    bot_guilds_result = Signal(object)          # BotGuildList or error string
     activate_window = Signal()
 
     def __init__(self, db: Database, tray: QSystemTrayIcon | None, icon: QIcon) -> None:

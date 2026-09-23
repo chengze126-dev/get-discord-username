@@ -540,8 +540,15 @@ async def _rest_client(token: str) -> discord.Client:
     return client
 
 
-async def list_bot_guilds(token: str) -> list[BotGuild]:
-    """Servers the bot has been invited to (REST: GET /users/@me/guilds)."""
+@dataclass
+class BotGuildList:
+    guilds: list[BotGuild]
+    invite_url: str      # adds THIS bot to a server (scope=bot)
+    bot_name: str
+
+
+async def list_bot_guilds(token: str) -> BotGuildList:
+    """Servers the bot has been invited to (REST: GET /users/@me/guilds) plus its invite URL."""
     client = await _rest_client(token.strip())
     try:
         guilds = [
@@ -549,7 +556,8 @@ async def list_bot_guilds(token: str) -> list[BotGuild]:
             async for g in client.fetch_guilds(limit=None, with_counts=True)
         ]
         guilds.sort(key=lambda g: g.name.casefold())
-        return guilds
+        app_info = await client.application_info()
+        return BotGuildList(guilds, invite_url(app_info.id), str(client.user) if client.user else app_info.name)
     finally:
         await client.close()
 

@@ -48,15 +48,22 @@ def resolve_token() -> str:
     return getpass.getpass("Bot token (input hidden): ").strip()
 
 
+INVITE_URL = ""
+
+
 async def fetch_guilds(token: str) -> list[tuple[int, str, int | None]]:
     import discord
 
+    from app.discord_service import invite_url
+
+    global INVITE_URL
     client = discord.Client(intents=discord.Intents.none())
     try:
         await client.login(token)
         guilds = []
         async for guild in client.fetch_guilds(limit=None, with_counts=True):
             guilds.append((guild.id, guild.name, guild.approximate_member_count))
+        INVITE_URL = invite_url((await client.application_info()).id)
         return guilds
     finally:
         await client.close()
@@ -124,8 +131,10 @@ def main() -> int:
         return 1
 
     if not guilds:
-        print("The bot is not in any server yet. Invite it first:")
-        print("  https://discord.com/oauth2/authorize?client_id=YOUR_CLIENT_ID&scope=bot&permissions=1024")
+        print("The token works, but the bot is not in any server yet. Open this link, pick your server and")
+        print("click Authorize (you need Manage Server permission on that server):")
+        print(f"  {INVITE_URL}")
+        print("A link with only scope=applications.commands does NOT add the bot.")
         return 1
 
     guilds.sort(key=lambda g: g[1].casefold())

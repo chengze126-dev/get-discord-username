@@ -7,7 +7,8 @@ import html
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from PySide6.QtCore import QDate, QDateTime, Qt, QTime, QTimeZone, Signal
+from PySide6.QtCore import QDate, QDateTime, Qt, QTime, QTimeZone, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.config import MAX_GUILDS, MAX_SCAN_INTERVAL, MIN_SCAN_INTERVAL, Settings, parse_guild_ids
-from app.discord_service import BotGuild, ConnectionTestResult
+from app.discord_service import BotGuild, BotGuildList, ConnectionTestResult
 from ui.components.icons import themed_icon
 from ui.components.toggle_switch import ToggleSwitch
 from ui.dashboard import PageHeader
@@ -274,6 +275,25 @@ class SettingsPage(QWidget):
         self.test_result.setWordWrap(True)
         self.test_result.hide()
         discord_section.add_widget(self.test_result)
+
+        # Shown when the bot still has to be added to a server.
+        self._invite_url = ""
+        self.invite_row = QWidget()
+        invite_layout = QHBoxLayout(self.invite_row)
+        invite_layout.setContentsMargins(0, 8, 0, 0)
+        invite_layout.setSpacing(8)
+        self.invite_open = QPushButton("Open invite page")
+        self.invite_open.setObjectName("PrimaryButton")
+        self.invite_copy = QPushButton("Copy invite link")
+        self.invite_copy.setObjectName("SecondaryButton")
+        for button in (self.invite_open, self.invite_copy):
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            invite_layout.addWidget(button)
+        invite_layout.addStretch(1)
+        self.invite_open.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._invite_url)))
+        self.invite_copy.clicked.connect(lambda: QGuiApplication.clipboard().setText(self._invite_url))
+        self.invite_row.hide()
+        discord_section.add_widget(self.invite_row)
         spacer = QWidget()
         spacer.setFixedHeight(8)
         discord_section.add_widget(spacer)
@@ -381,29 +401,45 @@ class SettingsPage(QWidget):
     def current_guild_ids(self) -> tuple[int, ...]:
         return parse_guild_ids(self.guild.toPlainText())[:MAX_GUILDS]
 
-    def show_bot_guilds(self, result) -> None:
-        """Result of 'Find my servers…': list[BotGuild] or an error message."""
+    def show_bot_guilds(self, result: BotGuildList | str) -> None:
+        """Result of 'Find my servers…': the bot's servers + invite link, or an error message."""
         self.find_servers.setEnabled(True)
         self.find_servers.setText("Find my servers…")
+        self.invite_row.hide()
         if isinstance(result, str):
             self._show_message(False, "Could not list servers", [result])
             return
-        if not result:
+        self._invite_url = result.invite_url
+        if not result.guilds:
             self._show_message(
                 False,
-                "The bot is not in any server yet",
-                ["Invite it with the OAuth2 URL Generator: scope = bot (not only applications.commands)."],
+                f"{result.bot_name} is not in any server yet",
+                [
+                    "The token works, but the bot has not been added to a server.",
+                    "Click 'Open invite page', choose your server (you need Manage Server permission) and click Authorize.",
+                    "A link with only scope=applications.commands does not add the bot. The link below uses scope=bot.",
+                    f"Invite link: {result.invite_url}",
+                    "Then click 'Find my servers…' again.",
+                ],
             )
+            self.invite_row.show()
             return
-        dialog = GuildPickerDialog(result, self.current_guild_ids(), self)
+        self.test_result.hide()
+        dialog = GuildPickerDialog(result.guilds, self.current_guild_ids(), self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            known = {g.id for g in result}
+            known = {g.id for g in result.guilds}
             # keep manually entered IDs the bot can't see (so the user notices them), then the ticked ones
             kept = [g for g in self.current_guild_ids() if g not in known]
             self.guild.setPlainText("\n".join(str(g) for g in kept + dialog.selected_ids()))
 
     def show_test_result(self, result: ConnectionTestResult) -> None:
         self._show_message(result.ok, result.title, result.details)
+        links = [part for line in result.details for part in line.split() if part.startswith("https://discord.com/oauth2/")]
+        if links and not result.ok:
+            self._invite_url = links[0]
+            self.invite_row.show()
+        else:
+            self.invite_row.hide()
         self.set_testing(False)
 
     def _show_message(self, ok: bool, title: str, details: list[str]) -> None:
