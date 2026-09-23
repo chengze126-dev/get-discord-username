@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from app import APP_ID
-from app.utils import SecretRedactingFilter, ensure_utc, from_iso, to_iso
+from app.utils import PROJECT_ROOT, SecretRedactingFilter, ensure_utc, from_iso, to_iso
 
 if TYPE_CHECKING:
     from app.database import Database
@@ -26,6 +26,10 @@ MIN_SCAN_INTERVAL = 60
 MAX_SCAN_INTERVAL = 24 * 60 * 60
 DEFAULT_CUTOFF = datetime(2024, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 THEMES = ("dark", "light", "system")
+
+ENV_PATH = PROJECT_ROOT / ".env"
+ENV_EXAMPLE_PATH = PROJECT_ROOT / ".env.example"
+GUILD_ENV_KEY = "DISCORD_GUILD_ID"
 
 KEYRING_SERVICE = APP_ID
 KEYRING_USERNAME = "discord-bot-token"
@@ -73,6 +77,33 @@ def _parse_int(value: str | None) -> int | None:
     return int(value)
 
 
+def write_env_value(key: str, value: str, path=ENV_PATH) -> None:
+    """Set ``key=value`` in the .env file, keeping every other line unchanged.
+
+    Creates the file from .env.example when it does not exist yet. Only
+    non-secret values should be written here (the bot token never is).
+    """
+    if path.exists():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    elif ENV_EXAMPLE_PATH.exists():
+        lines = ENV_EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
+    else:
+        lines = []
+    new_line = f"{key}={value}"
+    replaced = False
+    for index, line in enumerate(lines):
+        stripped = line.strip().lstrip("#").strip()
+        if not replaced and (stripped.startswith(f"{key}=") or stripped == key):
+            lines[index] = new_line
+            replaced = True
+    if not replaced:
+        lines.append(new_line)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    os.environ[key] = value  # keep this process consistent with the file
+
+
 class SettingsStore:
     """Loads/saves :class:`Settings` from the database settings table."""
 
@@ -81,7 +112,8 @@ class SettingsStore:
 
     def load(self) -> Settings:
         raw = self._db.get_all_settings()
-        guild_id = _parse_int(raw.get("guild_id")) or _parse_int(os.environ.get("DISCORD_GUILD_ID"))
+        # .env / environment wins, so edits to .env (by hand or set_guild_id.py) take effect.
+        guild_id = _parse_int(os.environ.get(GUILD_ENV_KEY)) or _parse_int(raw.get("guild_id"))
         cutoff = from_iso(raw.get("cutoff")) or DEFAULT_CUTOFF
         return Settings(
             guild_id=guild_id,

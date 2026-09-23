@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 from PySide6.QtCore import QObject, Signal
@@ -17,7 +18,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QSystemTrayIcon
 
 from app.avatars import AvatarCache
-from app.config import Settings, SettingsStore, TokenStore
+from app.config import ENV_PATH, GUILD_ENV_KEY, Settings, SettingsStore, TokenStore, write_env_value
 from app.database import Database, DatabaseError
 from app.discord_service import DiscordService, GuildInfo, test_connection
 from app.models import ERROR_TITLES, ActivityEvent, ConnectionState, ErrorKind, MemberRecord, ScanResult
@@ -214,6 +215,7 @@ class AppController(QObject):
         except DatabaseError as exc:
             self._report_error(ErrorKind.DATABASE.value, f"Could not save settings: {exc}")
             return
+        self._sync_guild_to_env(new.guild_id)
         self.settings = new
         self.scanner.update_settings(new)
         self.notifier.set_sound_enabled(new.notification_sound)
@@ -238,6 +240,17 @@ class AppController(QObject):
         self.log_activity("info", "Settings saved")
         self.toast.emit("success", "Settings saved", "")
         self.settings_changed.emit(new)
+
+    def _sync_guild_to_env(self, guild_id: int | None) -> None:
+        """Mirror the Guild ID into .env so the file and the Settings page always agree."""
+        value = str(guild_id) if guild_id else ""
+        if os.environ.get(GUILD_ENV_KEY, "").strip() == value and (ENV_PATH.exists() or not value):
+            return
+        try:
+            write_env_value(GUILD_ENV_KEY, value)
+            self.log_activity("info", f"Updated {GUILD_ENV_KEY} in .env")
+        except OSError as exc:
+            self.toast.emit("warning", "Could not update .env", f"The Guild ID was saved in the app, but .env could not be written: {exc}")
 
     # -------------------------------------------------------------- handlers
 

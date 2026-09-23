@@ -196,7 +196,7 @@ class SettingsPage(QWidget):
         self.guild.setMinimumWidth(320)
         discord_section.add_row(
             "Guild ID",
-            "Developer Mode → right-click the server icon → Copy Server ID",
+            "Developer Mode → right-click the server icon → Copy Server ID. Saved to .env as DISCORD_GUILD_ID.",
             self.guild,
         )
 

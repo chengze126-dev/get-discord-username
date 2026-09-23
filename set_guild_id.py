@@ -23,7 +23,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ENV_PATH = ROOT / ".env"
-EXAMPLE_PATH = ROOT / ".env.example"
 KEY = "DISCORD_GUILD_ID"
 
 sys.path.insert(0, str(ROOT))
@@ -63,27 +62,9 @@ async def fetch_guilds(token: str) -> list[tuple[int, str, int | None]]:
 
 def write_guild_id(guild_id: int) -> None:
     """Set DISCORD_GUILD_ID in .env, keeping every other line unchanged."""
-    if ENV_PATH.exists():
-        lines = ENV_PATH.read_text(encoding="utf-8").splitlines()
-    elif EXAMPLE_PATH.exists():
-        lines = EXAMPLE_PATH.read_text(encoding="utf-8").splitlines()
-    else:
-        lines = []
+    from app.config import write_env_value
 
-    new_line = f"{KEY}={guild_id}"
-    replaced = False
-    for index, line in enumerate(lines):
-        stripped = line.strip().lstrip("#").strip()
-        if stripped.startswith(f"{KEY}=") or stripped == KEY:
-            if not replaced:
-                lines[index] = new_line
-                replaced = True
-    if not replaced:
-        lines.append(new_line)
-
-    tmp = ENV_PATH.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.replace(tmp, ENV_PATH)
+    write_env_value(KEY, str(guild_id), ENV_PATH)
 
 
 def choose(guilds: list[tuple[int, str, int | None]], name: str | None) -> tuple[int, str, int | None] | None:
@@ -155,7 +136,7 @@ def main() -> int:
     gid, name, _ = picked
     write_guild_id(gid)
     print(f'Saved {KEY}={gid} ("{name}") to {ENV_PATH}')
-    print("Note: if you also set a Guild ID on the app's Settings page, that value wins. Clear it there to use .env.")
+    print("Restart the app to use this server. The Settings page will then show this ID.")
     return 0
 
 

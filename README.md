@@ -152,7 +152,9 @@ python set_guild_id.py --name Dev # picks the server whose name contains "Dev"
 python set_guild_id.py --list     # only lists the servers
 ```
 
-The script uses the bot token from `.env` or the credential store (or asks for it). It only sees servers the bot has been invited to. If you ever saved a Guild ID on the Settings page, that saved value wins over `.env`.
+The script uses the bot token from `.env` or the credential store (or asks for it). It only sees servers the bot has been invited to.
+
+The Guild ID is kept in sync both ways: saving a Guild ID on the **Settings** page also writes `DISCORD_GUILD_ID` to `.env`, and on startup the value in `.env` is used. The bot token is never written to `.env` by the app.
 
 `.env` is git-ignored. Token lookup order: OS credential store → `DISCORD_BOT_TOKEN` → a session-only token entered in the UI.
 
